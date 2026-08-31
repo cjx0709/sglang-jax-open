@@ -13,6 +13,7 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sgl_jax.srt.layers.attention.linear.short_convolution import short_convolution
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 if TYPE_CHECKING:
@@ -106,10 +107,39 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         a = a.reshape(a.shape[0], layer.num_q_heads, layer.head_q_dim)
         b = b.reshape(b.shape[0], layer.num_q_heads)
 
+        for name, value in (
+            ("q_post_conv", q),
+            ("k_post_conv", k),
+            ("v_post_conv", v),
+            ("raw_gate", a),
+            ("beta", b),
+        ):
+            maybe_dump_jax_array(
+                value,
+                component="ling3_kda_detail",
+                name=name,
+                layer_id=layer.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
+
         # KDA requires L2-normalized q/k for all paths; upstream fuses this
         # via use_qk_l2norm_in_kernel=True, while current kernel doesn't support.
         q = l2_normalize(q)
         k = l2_normalize(k)
+        maybe_dump_jax_array(
+            q,
+            component="ling3_kda_detail",
+            name="q_normalized",
+            layer_id=layer.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            k,
+            component="ling3_kda_detail",
+            name="k_normalized",
+            layer_id=layer.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             output, new_recurrent = self._forward_extend(
@@ -136,6 +166,21 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             )
         else:
             raise NotImplementedError(f"KDA does not support {forward_batch.forward_mode}")
+
+        maybe_dump_jax_array(
+            output,
+            component="ling3_kda_detail",
+            name="kda_output",
+            layer_id=layer.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            new_recurrent,
+            component="ling3_kda_detail",
+            name="kda_final_state",
+            layer_id=layer.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         new_ssm_full = self.set_ssm_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices, new_recurrent
@@ -363,9 +408,22 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             "on",
             "yes",
         }:
+            g32 = g.astype(jnp.float32) + dt_bias.astype(jnp.float32)
+            exp_A = jnp.exp(A_log.astype(jnp.float32))[:, None]
+            if lower_bound is None:
+                activated_gate = -exp_A[None, ...] * jax.nn.softplus(g32)
+            else:
+                activated_gate = lower_bound * jax.nn.sigmoid(exp_A[None, ...] * g32)
+            maybe_dump_jax_array(
+                activated_gate,
+                component="ling3_kda_detail",
+                name="activated_gate",
+                layer_id=layer.layer_id,
+                forward_mode=ForwardMode.EXTEND,
+            )
 
             def _naive_single_request_call(
-                q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias
+                q, k, v, activated_gate, beta, initial_state, cu_seqlens
             ):
                 """Diagnostic sequential FP32 recurrence for one active request.
 
@@ -378,12 +436,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 k32 = k.astype(jnp.float32)
                 v32 = v.astype(jnp.float32)
                 beta32 = beta.astype(jnp.float32)
-                g32 = g.astype(jnp.float32) + dt_bias.astype(jnp.float32)
-                exp_A = jnp.exp(A_log.astype(jnp.float32))[:, None]
-                if lower_bound is None:
-                    g32 = -exp_A[None, ...] * jax.nn.softplus(g32)
-                else:
-                    g32 = lower_bound * jax.nn.sigmoid(exp_A[None, ...] * g32)
 
                 valid_tokens = jnp.arange(q.shape[0]) < cu_seqlens[1]
 
@@ -401,7 +453,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 final_state, output = jax.lax.scan(
                     _step,
                     initial_state[0].astype(jnp.float32),
-                    (q32, k32, v32, g32, beta32, valid_tokens),
+                    (q32, k32, v32, activated_gate, beta32, valid_tokens),
                 )
                 return output.astype(v.dtype), initial_state.at[0].set(final_state)
 
@@ -416,8 +468,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                     P("data", "tensor"),
                     P("data", "tensor", None, None),
                     P("data"),
-                    P("tensor"),
-                    P("tensor", None),
                 ),
                 out_specs=(
                     P("data", "tensor", None),
@@ -429,12 +479,10 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 q,
                 k,
                 v,
-                g,
+                activated_gate,
                 beta,
                 initial_state,
                 cu_seqlens,
-                A_log,
-                dt_bias,
             )
 
         def _chunk_kda_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):

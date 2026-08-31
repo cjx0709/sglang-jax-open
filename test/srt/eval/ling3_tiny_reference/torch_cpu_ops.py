@@ -9,10 +9,45 @@ official remote model can be used as a CPU numerical golden.
 from __future__ import annotations
 
 import importlib
+import os
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+_KDA_LAYER_IDS = (0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22)
+_CAPTURE_COUNTERS = {"short_conv": 0, "kda": 0, "gated_rmsnorm": 0}
+
+
+def _capture_targets() -> set[int]:
+    value = os.environ.get("LING3_TORCH_KDA_CAPTURE_LAYERS", "0,1,2,4")
+    return {int(item) for item in value.split(",") if item.strip()}
+
+
+def _capture_tensor(layer_id: int, name: str, value: torch.Tensor) -> None:
+    capture_dir = os.environ.get("LING3_TORCH_KDA_CAPTURE_DIR")
+    if not capture_dir or layer_id not in _capture_targets():
+        return
+    destination = Path(capture_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    array = value.detach().float().cpu().numpy()
+    np.save(destination / f"layer{layer_id:03d}_{name}.npy", array)
+
+
+def _next_capture_layer(component: str) -> int | None:
+    index = _CAPTURE_COUNTERS[component]
+    _CAPTURE_COUNTERS[component] = index + 1
+    if index >= len(_KDA_LAYER_IDS):
+        return None
+    return _KDA_LAYER_IDS[index]
+
+
+def _reset_capture_counters() -> None:
+    for component in _CAPTURE_COUNTERS:
+        _CAPTURE_COUNTERS[component] = 0
 
 
 def _activate(x: torch.Tensor, activation: str | None) -> torch.Tensor:
@@ -71,11 +106,24 @@ def short_convolution_forward_cpu(
 
     if x.device.type != "cpu":
         raise ValueError("Ling3 Torch golden replacement is CPU-only")
+
+    capture_layer = None
+    capture_stream = None
+    if x.ndim == 3 and x.shape[1] > 1:
+        call_index = _CAPTURE_COUNTERS["short_conv"]
+        _CAPTURE_COUNTERS["short_conv"] = call_index + 1
+        layer_index, stream_index = divmod(call_index, 3)
+        if layer_index < len(_KDA_LAYER_IDS):
+            capture_layer = _KDA_LAYER_IDS[layer_index]
+            capture_stream = ("q", "k", "v")[stream_index]
+            _capture_tensor(capture_layer, f"{capture_stream}_proj", x)
     if mask is not None:
         x = x * mask.unsqueeze(-1)
 
     if cu_seqlens is None:
-        y, new_cache = _conv_sequence(x, self.weight, self.bias, cache, self.activation, residual)
+        y, new_cache = _conv_sequence(
+            x, self.weight, self.bias, cache, self.activation, residual
+        )
     else:
         if x.shape[0] != 1:
             raise ValueError("Packed short convolution expects batch size 1")
@@ -83,7 +131,9 @@ def short_convolution_forward_cpu(
         outputs = []
         states = []
         for sequence_index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
-            sequence_cache = None if cache is None else cache[sequence_index : sequence_index + 1]
+            sequence_cache = (
+                None if cache is None else cache[sequence_index : sequence_index + 1]
+            )
             sequence_residual = None if residual is None else residual[:, start:end]
             output, state = _conv_sequence(
                 x[:, start:end],
@@ -97,6 +147,8 @@ def short_convolution_forward_cpu(
             states.append(state)
         y = torch.cat(outputs, dim=1)
         new_cache = torch.cat(states, dim=0)
+    if capture_layer is not None:
+        _capture_tensor(capture_layer, f"{capture_stream}_post_conv", y)
     return y, new_cache if output_final_state else None
 
 
@@ -110,6 +162,10 @@ def rms_norm_gated_forward_cpu(
 ):
     """CPU equation for ``FusedRMSNormGated(activation='sigmoid')``."""
 
+    capture_layer = _next_capture_layer("gated_rmsnorm")
+    if capture_layer is not None:
+        _capture_tensor(capture_layer, "o_before_norm", x)
+        _capture_tensor(capture_layer, "output_gate", g)
     residual_out = x.float()
     if residual is not None:
         residual_out = residual_out + residual.float()
@@ -126,6 +182,8 @@ def rms_norm_gated_forward_cpu(
     else:
         raise ValueError(f"Unsupported gated RMSNorm activation: {self.activation}")
     output = normalized.to(x.dtype)
+    if capture_layer is not None:
+        _capture_tensor(capture_layer, "o_after_norm", output)
     if not prenorm:
         return output
     residual_dtype = torch.float32 if residual_in_fp32 else x.dtype
@@ -134,7 +192,9 @@ def rms_norm_gated_forward_cpu(
 
 def _l2_normalize(x: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
     x32 = x.float()
-    return (x32 * torch.rsqrt(x32.square().sum(dim=-1, keepdim=True) + epsilon)).to(x.dtype)
+    return (x32 * torch.rsqrt(x32.square().sum(dim=-1, keepdim=True) + epsilon)).to(
+        x.dtype
+    )
 
 
 def _activate_kda_gate(
@@ -168,7 +228,9 @@ def _recurrent_kda(
     if scale is None:
         scale = key_dim**-0.5
     q, k, v, g, beta = (item.float() for item in (q, k, v, g, beta))
-    state = torch.zeros(batch, heads, key_dim, value_dim, dtype=torch.float32, device=q.device)
+    state = torch.zeros(
+        batch, heads, key_dim, value_dim, dtype=torch.float32, device=q.device
+    )
     if initial_state is not None:
         state = state + initial_state.float()
     outputs = []
@@ -178,9 +240,15 @@ def _recurrent_kda(
         v_i = v[:, token_index]
         state = state * torch.exp(g[:, token_index])[..., None]
         residual = v_i - (k_i[..., None] * state).sum(dim=-2)
-        state = state + torch.einsum("bhk,bhv->bhkv", beta[:, token_index, :, None] * k_i, residual)
+        state = state + torch.einsum(
+            "bhk,bhv->bhkv", beta[:, token_index, :, None] * k_i, residual
+        )
         outputs.append(torch.einsum("bhk,bhkv->bhv", q_i, state))
-    output = torch.stack(outputs, dim=1) if outputs else v.new_empty(batch, 0, heads, value_dim)
+    output = (
+        torch.stack(outputs, dim=1)
+        if outputs
+        else v.new_empty(batch, 0, heads, value_dim)
+    )
     return output.to(dtype), state
 
 
@@ -206,6 +274,13 @@ def kda_cpu_reference(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Pure-Torch CPU implementation of the inference KDA recurrence."""
 
+    capture_layer = _next_capture_layer("kda")
+    if capture_layer is not None:
+        _capture_tensor(capture_layer, "q_post_conv", q)
+        _capture_tensor(capture_layer, "k_post_conv", k)
+        _capture_tensor(capture_layer, "v_post_conv", v)
+        _capture_tensor(capture_layer, "raw_gate", g)
+        _capture_tensor(capture_layer, "raw_beta", beta)
     if state_v_first:
         raise NotImplementedError("Ling3 Tiny uses state_v_first=False")
     if use_qk_l2norm_in_kernel:
@@ -216,6 +291,11 @@ def kda_cpu_reference(
         beta = torch.sigmoid(beta.float()).to(beta.dtype)
         if allow_neg_eigval:
             beta = beta * 2
+    if capture_layer is not None:
+        _capture_tensor(capture_layer, "q_normalized", q)
+        _capture_tensor(capture_layer, "k_normalized", k)
+        _capture_tensor(capture_layer, "activated_gate", g)
+        _capture_tensor(capture_layer, "beta", beta)
 
     if cu_seqlens is None:
         output, final_state = _recurrent_kda(q, k, v, g, beta, scale, initial_state)
@@ -244,12 +324,19 @@ def kda_cpu_reference(
             states.append(state)
         output = torch.cat(outputs, dim=1)
         final_state = torch.cat(states, dim=0)
+    if capture_layer is not None:
+        _capture_tensor(capture_layer, "kda_output", output)
+        _capture_tensor(capture_layer, "kda_final_state", final_state)
     return output, final_state if output_final_state else None
 
 
 def install_cpu_reference_ops(model) -> dict[str, str]:
     """Patch only the fused FLA call sites in an official HF model instance."""
 
+    # The golden generator installs the shims once for a reduced self-test and
+    # once for the real checkpoint. Reset here so capture layer IDs always refer
+    # to the first real prefill after each installation.
+    _reset_capture_counters()
     modeling_module = importlib.import_module(model.__class__.__module__)
     modeling_module.ShortConvolution.forward = short_convolution_forward_cpu
     modeling_module.FusedRMSNormGated.forward = rms_norm_gated_forward_cpu

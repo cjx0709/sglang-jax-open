@@ -377,9 +377,32 @@ class BailingKDAAttention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
+        for name, value in (("q_proj", q), ("k_proj", k), ("v_proj", v)):
+            maybe_dump_jax_array(
+                value,
+                component="ling3_kda_detail",
+                name=name,
+                layer_id=self.layer_idx,
+                forward_mode=forward_batch.forward_mode,
+            )
+
         raw_gate, _ = self.f_proj(hidden_states)
         raw_gate = raw_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
         beta = jax.nn.sigmoid(self.b_proj(hidden_states)[0].astype(jnp.float32))
+        maybe_dump_jax_array(
+            raw_gate,
+            component="ling3_kda_detail",
+            name="raw_gate",
+            layer_id=self.layer_idx,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            beta,
+            component="ling3_kda_detail",
+            name="beta",
+            layer_id=self.layer_idx,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         o, recurrent_state_pool = self.attn(
             forward_batch,
@@ -391,11 +414,33 @@ class BailingKDAAttention(nnx.Module):
             recurrent_state_pool,
         )
         o = o.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
+        maybe_dump_jax_array(
+            o,
+            component="ling3_kda_detail",
+            name="o_before_norm",
+            layer_id=self.layer_idx,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         output_gate, _ = self.g_proj(hidden_states)
         output_gate = output_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
+        maybe_dump_jax_array(
+            output_gate,
+            component="ling3_kda_detail",
+            name="output_gate",
+            layer_id=self.layer_idx,
+            forward_mode=forward_batch.forward_mode,
+        )
         # GatedRMSNorm: RMSNorm(o) * sigmoid(output_gate).
-        o = self.o_norm(o, output_gate).reshape(hidden_states.shape[0], self.projection_size)
+        o = self.o_norm(o, output_gate)
+        maybe_dump_jax_array(
+            o,
+            component="ling3_kda_detail",
+            name="o_after_norm",
+            layer_id=self.layer_idx,
+            forward_mode=forward_batch.forward_mode,
+        )
+        o = o.reshape(hidden_states.shape[0], self.projection_size)
         o, _ = self.o_proj(o)
         return o, recurrent_state_pool
 
