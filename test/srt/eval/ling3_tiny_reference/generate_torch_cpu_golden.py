@@ -303,13 +303,15 @@ def _install_mla_capture_hooks(model, layer_index: int = 3):
         return hook
 
     def capture_input(name: str):
-        def hook(_module, inputs):
-            save(name, inputs)
+        def hook(_module, inputs, kwargs):
+            save(name, (inputs, tuple(kwargs.values())))
 
         return hook
 
     handles.append(
-        attention.register_forward_pre_hook(capture_input("attention_input"))
+        attention.register_forward_pre_hook(
+            capture_input("attention_input"), with_kwargs=True
+        )
     )
     handles.append(attention.register_forward_hook(capture_output("attention_output")))
     for module_name, capture_name in (
@@ -326,7 +328,11 @@ def _install_mla_capture_hooks(model, layer_index: int = 3):
             raise RuntimeError(f"official MLA is missing expected module {module_name}")
         handles.append(module.register_forward_hook(capture_output(capture_name)))
     dense = attention.dense
-    handles.append(dense.register_forward_pre_hook(capture_input("gated_pre_o_proj")))
+    handles.append(
+        dense.register_forward_pre_hook(
+            capture_input("gated_pre_o_proj"), with_kwargs=True
+        )
+    )
     handles.append(dense.register_forward_hook(capture_output("o_proj_output")))
 
     modeling_module = importlib.import_module(model.__class__.__module__)
