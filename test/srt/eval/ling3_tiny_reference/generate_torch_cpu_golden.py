@@ -41,6 +41,7 @@ def _load_model(model_path: str, revision: str):
         revision=revision,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
+        attn_implementation="eager",
     )
     try:
         return AutoModelForCausalLM.from_pretrained(
@@ -576,6 +577,11 @@ def main() -> None:
     )
     load_started = time.perf_counter()
     model = _load_model(model_path, revision)
+    if model.config._attn_implementation != "eager":
+        raise RuntimeError(
+            "Torch CPU golden requires a causal eager attention mask, got "
+            f"{model.config._attn_implementation!r}"
+        )
     patches = install_cpu_reference_ops(model)
     model.eval()
     load_seconds = time.perf_counter() - load_started
@@ -620,6 +626,7 @@ def main() -> None:
         "modeling_source": str(modeling_source),
         "modeling_source_sha256": _sha256(modeling_source),
         "cpu_op_replacements": patches,
+        "attn_implementation": model.config._attn_implementation,
         "torch_version": torch.__version__,
         "transformers_version": __import__("transformers").__version__,
         "python_version": platform.python_version(),
