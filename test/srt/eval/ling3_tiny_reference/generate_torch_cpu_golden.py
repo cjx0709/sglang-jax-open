@@ -268,7 +268,7 @@ def _install_prefill_capture_hooks(model):
 def _install_mla_capture_hooks(model, layer_index: int = 3):
     capture_dir_value = os.environ.get("LING3_TORCH_MLA_CAPTURE_DIR")
     if not capture_dir_value:
-        return {}, []
+        return {}, [], []
 
     capture_dir = Path(capture_dir_value)
     capture_dir.mkdir(parents=True, exist_ok=True)
@@ -276,6 +276,7 @@ def _install_mla_capture_hooks(model, layer_index: int = 3):
     attention = layer.attention
     captures: dict[str, torch.Tensor] = {}
     handles = []
+    restorers = []
 
     def first_tensor(value):
         if isinstance(value, torch.Tensor):
@@ -324,13 +325,49 @@ def _install_mla_capture_hooks(model, layer_index: int = 3):
         if module is None:
             raise RuntimeError(f"official MLA is missing expected module {module_name}")
         handles.append(module.register_forward_hook(capture_output(capture_name)))
-    handles.append(
-        attention.o_proj.register_forward_pre_hook(capture_input("gated_pre_o_proj"))
+    dense = attention.dense
+    handles.append(dense.register_forward_pre_hook(capture_input("gated_pre_o_proj")))
+    handles.append(dense.register_forward_hook(capture_output("o_proj_output")))
+
+    modeling_module = importlib.import_module(model.__class__.__module__)
+    original_rotary = modeling_module.apply_rotary_pos_emb_interleave
+
+    def capture_rotary(*args, **kwargs):
+        q_rotated, k_rotated = original_rotary(*args, **kwargs)
+        if "q_rope_rotated" not in captures:
+            save("q_rope_rotated", q_rotated.transpose(1, 2))
+            save("k_rope_rotated", k_rotated.transpose(1, 2))
+        return q_rotated, k_rotated
+
+    modeling_module.apply_rotary_pos_emb_interleave = capture_rotary
+    restorers.append(
+        lambda: setattr(
+            modeling_module, "apply_rotary_pos_emb_interleave", original_rotary
+        )
     )
-    handles.append(
-        attention.o_proj.register_forward_hook(capture_output("o_proj_output"))
+
+    original_attention = modeling_module.eager_attention_forward
+
+    def capture_attention(module, query, key, value, *args, **kwargs):
+        result = original_attention(module, query, key, value, *args, **kwargs)
+        if int(module.layer_idx) == layer_index:
+            save("q_after_rope", query.transpose(1, 2))
+            save("k_after_rope", key.transpose(1, 2))
+            attention_output = result[0]
+            save(
+                "pre_o_proj",
+                attention_output.reshape(
+                    *attention_output.shape[:-2],
+                    attention_output.shape[-2] * attention_output.shape[-1],
+                ),
+            )
+        return result
+
+    modeling_module.eager_attention_forward = capture_attention
+    restorers.append(
+        lambda: setattr(modeling_module, "eager_attention_forward", original_attention)
     )
-    return captures, handles
+    return captures, handles, restorers
 
 
 def _finalize_mla_captures(
@@ -376,8 +413,11 @@ def _finalize_mla_captures(
     gated = captures["gated_pre_o_proj"].reshape(
         *captures["gated_pre_o_proj"].shape[:-1], num_heads, v_head_dim
     )
-    pre_o_proj = gated / activated_gate[..., None].clamp_min(1e-12)
-    save("pre_o_proj", pre_o_proj.reshape(*gated.shape[:-2], num_heads * v_head_dim))
+    recovered_pre_o_proj = gated / activated_gate[..., None].clamp_min(1e-12)
+    save(
+        "pre_o_proj_recovered",
+        recovered_pre_o_proj.reshape(*gated.shape[:-2], num_heads * v_head_dim),
+    )
 
 
 def _generate_case(
@@ -402,8 +442,8 @@ def _generate_case(
     capture_layers, component_captures, capture_handles = (
         _install_prefill_capture_hooks(model)
     )
-    mla_captures, mla_capture_handles = (
-        _install_mla_capture_hooks(model) if capture_mla else ({}, [])
+    mla_captures, mla_capture_handles, mla_capture_restorers = (
+        _install_mla_capture_hooks(model) if capture_mla else ({}, [], [])
     )
 
     with torch.inference_mode():
@@ -422,6 +462,8 @@ def _generate_case(
                     handle.remove()
                 for handle in mla_capture_handles:
                     handle.remove()
+                for restore in mla_capture_restorers:
+                    restore()
                 _finalize_mla_captures(model, mla_captures)
                 first_token_logits = logits.cpu().numpy()
                 prefill_hidden_states = torch.stack(
