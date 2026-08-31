@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import jax
@@ -56,9 +57,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         v_conv_w = layer.v_conv1d.weight.value
         # _unpack_conv_states splits proj_size in 3 equal pieces; only valid
         # when proj_q == proj_k == proj_v (Kimi-Linear shape).
-        assert (
-            q_conv_w.shape[0] == k_conv_w.shape[0] == v_conv_w.shape[0]
-        ), f"unequal Q/K/V proj widths: {q_conv_w.shape[0]}/{k_conv_w.shape[0]}/{v_conv_w.shape[0]}"
+        assert q_conv_w.shape[0] == k_conv_w.shape[0] == v_conv_w.shape[0], (
+            f"unequal Q/K/V proj widths: {q_conv_w.shape[0]}/{k_conv_w.shape[0]}/{v_conv_w.shape[0]}"
+        )
         q_state, k_state, v_state = self._unpack_conv_states(conv_states)
 
         cu_q_lens = self.forward_metadata.cu_q_lens
@@ -355,6 +356,86 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         dt_bias = layer.dt_bias.value.reshape(H, -1)
         scale = scale if scale is not None else layer.scale
         lower_bound = getattr(layer, "kda_lower_bound", None)
+
+        if os.environ.get("SGLANG_JAX_KDA_NAIVE_EXTEND", "0").lower() in {
+            "1",
+            "true",
+            "on",
+            "yes",
+        }:
+
+            def _naive_single_request_call(
+                q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias
+            ):
+                """Diagnostic sequential FP32 recurrence for one active request.
+
+                Static serving batches can contain token and request padding. The
+                first cumulative length is the sole active request length when the
+                server is launched with ``--max-running-requests 1``. Padded tokens
+                emit zero and, critically, do not advance the recurrent state.
+                """
+                q32 = q.astype(jnp.float32) * scale
+                k32 = k.astype(jnp.float32)
+                v32 = v.astype(jnp.float32)
+                beta32 = beta.astype(jnp.float32)
+                g32 = g.astype(jnp.float32) + dt_bias.astype(jnp.float32)
+                exp_A = jnp.exp(A_log.astype(jnp.float32))[:, None]
+                if lower_bound is None:
+                    g32 = -exp_A[None, ...] * jax.nn.softplus(g32)
+                else:
+                    g32 = lower_bound * jax.nn.sigmoid(exp_A[None, ...] * g32)
+
+                valid_tokens = jnp.arange(q.shape[0]) < cu_seqlens[1]
+
+                def _step(state, inputs):
+                    q_i, k_i, v_i, g_i, beta_i, is_valid = inputs
+                    decayed = state * jnp.exp(g_i)[..., None]
+                    predicted = jnp.einsum("hk,hkv->hv", k_i, decayed)
+                    residual = v_i - predicted
+                    updated = decayed + jnp.einsum("hk,hv->hkv", beta_i[..., None] * k_i, residual)
+                    output = jnp.einsum("hk,hkv->hv", q_i, updated)
+                    next_state = jnp.where(is_valid, updated, state)
+                    output = jnp.where(is_valid, output, jnp.zeros_like(output))
+                    return next_state, output
+
+                final_state, output = jax.lax.scan(
+                    _step,
+                    initial_state[0].astype(jnp.float32),
+                    (q32, k32, v32, g32, beta32, valid_tokens),
+                )
+                return output.astype(v.dtype), initial_state.at[0].set(final_state)
+
+            naive_sharded = jax.shard_map(
+                _naive_single_request_call,
+                mesh=self.mesh,
+                in_specs=(
+                    P("data", "tensor", None),
+                    P("data", "tensor", None),
+                    P("data", "tensor", None),
+                    P("data", "tensor", None),
+                    P("data", "tensor"),
+                    P("data", "tensor", None, None),
+                    P("data"),
+                    P("tensor"),
+                    P("tensor", None),
+                ),
+                out_specs=(
+                    P("data", "tensor", None),
+                    P("data", "tensor", None, None),
+                ),
+                check_vma=False,
+            )
+            return naive_sharded(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                cu_seqlens,
+                A_log,
+                dt_bias,
+            )
 
         def _chunk_kda_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
             o, final_state, *_ = chunk_kda(
