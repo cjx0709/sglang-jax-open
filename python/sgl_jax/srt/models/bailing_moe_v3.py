@@ -157,6 +157,7 @@ class BailingMLA(DeepseekV3Attention):
             dtype=dtype,
             use_absorbed=use_absorbed,
             skip_rope=False,
+            rope_weights_interleaved=rope_interleave,
         )
         # Head-wise gate: hidden_size -> num_heads (one scalar gate per head).
         self.g_proj = LinearBase(

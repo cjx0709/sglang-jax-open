@@ -126,6 +126,7 @@ class DeepseekV3Attention(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         use_absorbed: bool = True,
         skip_rope: bool = False,
+        rope_weights_interleaved: bool = False,
     ):
         super().__init__()
         self.mesh = mesh
@@ -137,6 +138,7 @@ class DeepseekV3Attention(nnx.Module):
         self.v_head_dim = v_head_dim
         self.kv_lora_rank = kv_lora_rank
         self.q_lora_rank = q_lora_rank
+        self.rope_weights_interleaved = rope_weights_interleaved
 
         if q_lora_rank is None:
             self.q_proj = LinearBase(
@@ -205,7 +207,7 @@ class DeepseekV3Attention(nnx.Module):
                 rotary_dim=qk_rope_head_dim,
                 max_position=max_position_embeddings,
                 base=int(rope_theta),
-                is_neox_style=not rope_interleave,
+                is_neox_style=rope_weights_interleaved or not rope_interleave,
                 rope_scaling=rope_scaling,
                 dtype=dtype,
             )
@@ -369,6 +371,9 @@ class DeepseekV3Attention(nnx.Module):
         )
 
         k_rope = k_rope_raw.reshape(-1, 1, self.qk_rope_head_dim)
+        if self.rope_weights_interleaved:
+            q_rope = self._deinterleave_rope_weights(q_rope)
+            k_rope = self._deinterleave_rope_weights(k_rope)
         if self.rotary_emb is not None:
             q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
         maybe_dump_jax_array(
@@ -403,6 +408,12 @@ class DeepseekV3Attention(nnx.Module):
         )
 
         return attn_output, kv_fused
+
+    @staticmethod
+    def _deinterleave_rope_weights(x: jax.Array) -> jax.Array:
+        """Convert adjacent RoPE weight pairs to the half-split runtime layout."""
+        dim = x.shape[-1]
+        return jnp.swapaxes(x.reshape(*x.shape[:-1], dim // 2, 2), -1, -2).reshape(x.shape)
 
     def _apply_o_proj(
         self,
