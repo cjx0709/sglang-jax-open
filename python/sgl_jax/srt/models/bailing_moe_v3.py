@@ -175,12 +175,37 @@ class BailingMLA(DeepseekV3Attention):
         hidden_states: jax.Array,
     ) -> jax.Array:
         gate, _ = self.g_proj(hidden_states)
+        maybe_dump_jax_array(
+            gate,
+            component="ling3_mla_detail",
+            name="raw_gate",
+            layer_id=self.layer_id,
+        )
         gate = jax.nn.sigmoid(gate.astype(jnp.float32)).astype(pre_o_proj.dtype)
+        maybe_dump_jax_array(
+            gate,
+            component="ling3_mla_detail",
+            name="activated_gate",
+            layer_id=self.layer_id,
+        )
         # pre_o_proj is flat [T, num_heads * v_head_dim]; gate is [T, num_heads].
         T = pre_o_proj.shape[0]
         gated = pre_o_proj.reshape(T, self.num_heads, self.v_head_dim) * gate[:, :, None]
         gated = gated.reshape(T, self.num_heads * self.v_head_dim)
-        return super()._apply_o_proj(gated, hidden_states)
+        maybe_dump_jax_array(
+            gated,
+            component="ling3_mla_detail",
+            name="gated_pre_o_proj",
+            layer_id=self.layer_id,
+        )
+        output = super()._apply_o_proj(gated, hidden_states)
+        maybe_dump_jax_array(
+            output,
+            component="ling3_mla_detail",
+            name="o_proj_output",
+            layer_id=self.layer_id,
+        )
+        return output
 
 
 # ---------------------------------------------------------------------------

@@ -57,7 +57,9 @@ def _load_model(model_path: str, revision: str):
 
 
 def _make_reduced_config(model_path: str, revision: str):
-    config = AutoConfig.from_pretrained(model_path, revision=revision, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(
+        model_path, revision=revision, trust_remote_code=True
+    )
     overrides = {
         "vocab_size": 64,
         "pad_token_id": 0,
@@ -155,9 +157,13 @@ def run_cpu_op_self_test(model_path: str, revision: str) -> None:
     with torch.inference_mode():
         output = model(input_ids=input_ids, use_cache=True, return_dict=True)
         if output.logits.shape != (1, input_ids.shape[1], config.vocab_size):
-            raise AssertionError(f"Unexpected self-test logits shape: {output.logits.shape}")
+            raise AssertionError(
+                f"Unexpected self-test logits shape: {output.logits.shape}"
+            )
         if not torch.isfinite(output.logits.float()).all():
-            raise AssertionError("CPU reference op self-test produced non-finite logits")
+            raise AssertionError(
+                "CPU reference op self-test produced non-finite logits"
+            )
         decode = model(
             input_ids=torch.tensor([[8]], dtype=torch.long),
             attention_mask=torch.ones((1, input_ids.shape[1] + 1), dtype=torch.long),
@@ -166,9 +172,13 @@ def run_cpu_op_self_test(model_path: str, revision: str) -> None:
             return_dict=True,
         )
         if decode.logits.shape != (1, 1, config.vocab_size):
-            raise AssertionError(f"Unexpected decode logits shape: {decode.logits.shape}")
+            raise AssertionError(
+                f"Unexpected decode logits shape: {decode.logits.shape}"
+            )
         if not torch.isfinite(decode.logits.float()).all():
-            raise AssertionError("CPU reference op decode self-test produced non-finite logits")
+            raise AssertionError(
+                "CPU reference op decode self-test produced non-finite logits"
+            )
     print("CPU reference op self-test passed", flush=True)
 
 
@@ -212,14 +222,19 @@ def _install_prefill_capture_hooks(model):
     def capture_router(layer_index: int):
         def hook(_module, _inputs, output):
             topk_ids, topk_weights, raw_logits = output
-            raw_logits = raw_logits.reshape(-1, raw_logits.shape[-1])[-1].detach().float().cpu()
+            raw_logits = (
+                raw_logits.reshape(-1, raw_logits.shape[-1])[-1].detach().float().cpu()
+            )
             captures["router_raw_logits"][layer_index] = raw_logits
             captures["router_scores"][layer_index] = torch.sigmoid(raw_logits)
             captures["router_topk_ids"][layer_index] = (
                 topk_ids.reshape(-1, topk_ids.shape[-1])[-1].detach().cpu()
             )
             captures["router_topk_weights"][layer_index] = (
-                topk_weights.reshape(-1, topk_weights.shape[-1])[-1].detach().float().cpu()
+                topk_weights.reshape(-1, topk_weights.shape[-1])[-1]
+                .detach()
+                .float()
+                .cpu()
             )
 
         return hook
@@ -232,18 +247,137 @@ def _install_prefill_capture_hooks(model):
             )
         )
         handles.append(
-            layer.attention.register_forward_hook(capture_hidden("attention_output", layer_index))
+            layer.attention.register_forward_hook(
+                capture_hidden("attention_output", layer_index)
+            )
         )
         handles.append(
             layer.post_attention_layernorm.register_forward_hook(
                 capture_hidden("moe_input", layer_index)
             )
         )
-        handles.append(layer.mlp.register_forward_hook(capture_hidden("mlp_output", layer_index)))
+        handles.append(
+            layer.mlp.register_forward_hook(capture_hidden("mlp_output", layer_index))
+        )
         gate = getattr(layer.mlp, "gate", None)
         if gate is not None:
             handles.append(gate.register_forward_hook(capture_router(layer_index)))
     return layers, captures, handles
+
+
+def _install_mla_capture_hooks(model, layer_index: int = 3):
+    capture_dir_value = os.environ.get("LING3_TORCH_MLA_CAPTURE_DIR")
+    if not capture_dir_value:
+        return {}, []
+
+    capture_dir = Path(capture_dir_value)
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    layer = model.model.layers[layer_index]
+    attention = layer.attention
+    captures: dict[str, torch.Tensor] = {}
+    handles = []
+
+    def first_tensor(value):
+        if isinstance(value, torch.Tensor):
+            return value
+        if isinstance(value, (tuple, list)):
+            for item in value:
+                tensor = first_tensor(item)
+                if tensor is not None:
+                    return tensor
+        return None
+
+    def save(name: str, value) -> None:
+        tensor = first_tensor(value)
+        if tensor is None:
+            raise RuntimeError(f"MLA capture {name} did not receive a tensor")
+        tensor = tensor.detach().float().cpu()
+        captures[name] = tensor
+        np.save(capture_dir / f"layer{layer_index:03d}_{name}.npy", tensor.numpy())
+
+    def capture_output(name: str):
+        def hook(_module, _inputs, output):
+            save(name, output)
+
+        return hook
+
+    def capture_input(name: str):
+        def hook(_module, inputs):
+            save(name, inputs)
+
+        return hook
+
+    handles.append(
+        attention.register_forward_pre_hook(capture_input("attention_input"))
+    )
+    handles.append(attention.register_forward_hook(capture_output("attention_output")))
+    for module_name, capture_name in (
+        ("q_a_proj", "q_compressed_raw"),
+        ("q_a_layernorm", "q_compressed_norm"),
+        ("q_b_proj", "q_full"),
+        ("kv_a_proj_with_mqa", "kv_a_out"),
+        ("kv_a_layernorm", "compressed_norm"),
+        ("kv_b_proj", "kv_full"),
+        ("g_proj", "raw_gate"),
+    ):
+        module = getattr(attention, module_name, None)
+        if module is None:
+            raise RuntimeError(f"official MLA is missing expected module {module_name}")
+        handles.append(module.register_forward_hook(capture_output(capture_name)))
+    handles.append(
+        attention.o_proj.register_forward_pre_hook(capture_input("gated_pre_o_proj"))
+    )
+    handles.append(
+        attention.o_proj.register_forward_hook(capture_output("o_proj_output"))
+    )
+    return captures, handles
+
+
+def _finalize_mla_captures(
+    model, captures: dict[str, torch.Tensor], layer_index: int = 3
+):
+    if not captures:
+        return
+    capture_dir = Path(os.environ["LING3_TORCH_MLA_CAPTURE_DIR"])
+    config = model.config
+    num_heads = int(config.num_attention_heads)
+    qk_nope_head_dim = int(config.qk_nope_head_dim)
+    qk_rope_head_dim = int(config.qk_rope_head_dim)
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    kv_lora_rank = int(config.kv_lora_rank)
+    v_head_dim = int(config.v_head_dim)
+
+    def save(name: str, tensor: torch.Tensor) -> None:
+        tensor = tensor.detach().float().cpu()
+        captures[name] = tensor
+        np.save(capture_dir / f"layer{layer_index:03d}_{name}.npy", tensor.numpy())
+
+    q = captures["q_full"].reshape(
+        *captures["q_full"].shape[:-1], num_heads, qk_head_dim
+    )
+    save("q_nope_raw", q[..., :qk_nope_head_dim])
+    save("q_rope_raw", q[..., qk_nope_head_dim:])
+
+    kv_a_out = captures["kv_a_out"]
+    save("compressed_raw", kv_a_out[..., :kv_lora_rank])
+    save("k_rope_raw", kv_a_out[..., kv_lora_rank:])
+
+    kv = captures["kv_full"].reshape(
+        *captures["kv_full"].shape[:-1],
+        num_heads,
+        qk_nope_head_dim + v_head_dim,
+    )
+    save("k_nope", kv[..., :qk_nope_head_dim])
+    save("v", kv[..., qk_nope_head_dim:])
+
+    raw_gate = captures["raw_gate"]
+    activated_gate = torch.sigmoid(raw_gate)
+    save("activated_gate", activated_gate)
+    gated = captures["gated_pre_o_proj"].reshape(
+        *captures["gated_pre_o_proj"].shape[:-1], num_heads, v_head_dim
+    )
+    pre_o_proj = gated / activated_gate[..., None].clamp_min(1e-12)
+    save("pre_o_proj", pre_o_proj.reshape(*gated.shape[:-2], num_heads * v_head_dim))
 
 
 def _generate_case(
@@ -253,6 +387,7 @@ def _generate_case(
     enable_thinking: bool,
     max_new_tokens: int,
     top_k: int,
+    capture_mla: bool = False,
 ) -> dict[str, np.ndarray]:
     input_ids = _render_input_ids(tokenizer, case, enable_thinking)
     attention_mask = torch.ones_like(input_ids)
@@ -264,7 +399,12 @@ def _generate_case(
     first_token_logits = None
     prefill_hidden_states = None
     prefill_components = None
-    capture_layers, component_captures, capture_handles = _install_prefill_capture_hooks(model)
+    capture_layers, component_captures, capture_handles = (
+        _install_prefill_capture_hooks(model)
+    )
+    mla_captures, mla_capture_handles = (
+        _install_mla_capture_hooks(model) if capture_mla else ({}, [])
+    )
 
     with torch.inference_mode():
         for step in range(max_new_tokens):
@@ -280,6 +420,9 @@ def _generate_case(
             if step == 0:
                 for handle in capture_handles:
                     handle.remove()
+                for handle in mla_capture_handles:
+                    handle.remove()
+                _finalize_mla_captures(model, mla_captures)
                 first_token_logits = logits.cpu().numpy()
                 prefill_hidden_states = torch.stack(
                     [state[0, -1].float().cpu() for state in output.hidden_states]
@@ -290,14 +433,22 @@ def _generate_case(
                     name: torch.stack(
                         [component_captures[name][index] for index in range(num_layers)]
                     ).numpy()
-                    for name in ("attention_input", "attention_output", "moe_input", "mlp_output")
+                    for name in (
+                        "attention_input",
+                        "attention_output",
+                        "moe_input",
+                        "mlp_output",
+                    )
                 }
                 num_experts = int(model.config.num_experts)
                 for name in ("router_raw_logits", "router_scores"):
                     prefill_components[name] = torch.stack(
                         [
                             component_captures[name].get(
-                                index, torch.full((num_experts,), torch.nan, dtype=torch.float32)
+                                index,
+                                torch.full(
+                                    (num_experts,), torch.nan, dtype=torch.float32
+                                ),
                             )
                             for index in range(num_layers)
                         ]
@@ -372,7 +523,9 @@ def main() -> None:
         return
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, revision=revision, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, revision=revision, trust_remote_code=True
+    )
     load_started = time.perf_counter()
     model = _load_model(model_path, revision)
     patches = install_cpu_reference_ops(model)
@@ -391,6 +544,8 @@ def main() -> None:
             bool(prompt_spec["enable_thinking"]),
             int(prompt_spec["max_new_tokens"]),
             int(prompt_spec["top_k"]),
+            capture_mla=case["name"]
+            == os.environ.get("LING3_TORCH_MLA_CAPTURE_CASE", "english_fact"),
         )
         path = args.output_dir / f"{case['name']}.npz"
         np.savez_compressed(path, **arrays)

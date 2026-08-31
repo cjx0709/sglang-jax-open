@@ -38,6 +38,7 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,7 @@ class DeepseekV3Attention(nnx.Module):
     ):
         super().__init__()
         self.mesh = mesh
+        self.layer_id = layer_id
         self.num_heads = num_heads
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -292,20 +294,97 @@ class DeepseekV3Attention(nnx.Module):
             q, _ = self.q_proj(hidden_states)
         else:
             q_compressed, _ = self.q_a_proj(hidden_states)
+            maybe_dump_jax_array(
+                q_compressed,
+                component="ling3_mla_detail",
+                name="q_compressed_raw",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
             q_compressed = self.q_a_layernorm(q_compressed)
+            maybe_dump_jax_array(
+                q_compressed,
+                component="ling3_mla_detail",
+                name="q_compressed_norm",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
             q, _ = self.q_b_proj(q_compressed)
+        maybe_dump_jax_array(
+            q,
+            component="ling3_mla_detail",
+            name="q_full",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
         q = q.reshape(-1, self.num_heads, self.qk_head_dim)
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
+        maybe_dump_jax_array(
+            q_nope,
+            component="ling3_mla_detail",
+            name="q_nope_raw",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            q_rope,
+            component="ling3_mla_detail",
+            name="q_rope_raw",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         kv_a_out, _ = self.kv_a_proj(hidden_states)
+        maybe_dump_jax_array(
+            kv_a_out,
+            component="ling3_mla_detail",
+            name="kv_a_out",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
         compressed = kv_a_out[:, : self.kv_lora_rank]
         k_rope_raw = kv_a_out[:, self.kv_lora_rank :]
+        maybe_dump_jax_array(
+            compressed,
+            component="ling3_mla_detail",
+            name="compressed_raw",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            k_rope_raw,
+            component="ling3_mla_detail",
+            name="k_rope_raw",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
         compressed = self.kv_a_layernorm(compressed)
+        maybe_dump_jax_array(
+            compressed,
+            component="ling3_mla_detail",
+            name="compressed_norm",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         k_rope = k_rope_raw.reshape(-1, 1, self.qk_rope_head_dim)
         if self.rotary_emb is not None:
             q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        maybe_dump_jax_array(
+            q_rope,
+            component="ling3_mla_detail",
+            name="q_rope_rotated",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            k_rope,
+            component="ling3_mla_detail",
+            name="k_rope_rotated",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         if self.use_absorbed:
             attn_output, kv_fused = self._forward_mqa(
@@ -315,6 +394,13 @@ class DeepseekV3Attention(nnx.Module):
             attn_output, kv_fused = self._forward_mha(
                 q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
             )
+        maybe_dump_jax_array(
+            attn_output,
+            component="ling3_mla_detail",
+            name="pre_o_proj",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         return attn_output, kv_fused
 
@@ -410,8 +496,29 @@ class DeepseekV3Attention(nnx.Module):
     ) -> tuple[jax.Array, jax.Array]:
         # Decompress latent c_kv into per-head K-nope and V via kv_b_proj.
         kv, _ = self.kv_b_proj(compressed)
+        maybe_dump_jax_array(
+            kv,
+            component="ling3_mla_detail",
+            name="kv_full",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
         kv = kv.reshape(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = jnp.split(kv, [self.qk_nope_head_dim], axis=-1)
+        maybe_dump_jax_array(
+            k_nope,
+            component="ling3_mla_detail",
+            name="k_nope",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            v,
+            component="ling3_mla_detail",
+            name="v",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         # k_rope is shared across heads — broadcast with the head-sharded spec
         # so the downstream concat keeps "tensor" sharding on the head axis.
@@ -423,6 +530,20 @@ class DeepseekV3Attention(nnx.Module):
 
         q = jnp.concatenate([q_nope, q_rope], axis=-1)
         k = jnp.concatenate([k_nope, k_rope], axis=-1)
+        maybe_dump_jax_array(
+            q,
+            component="ling3_mla_detail",
+            name="q_after_rope",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            k,
+            component="ling3_mla_detail",
+            name="k_after_rope",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         # RPA v3 requires k.shape[-1] == v.shape[-1]; attn_mha is configured with
         # v_head_dim=qk_head_dim, so pad V on the head dim and strip the pad off
